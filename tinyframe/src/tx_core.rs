@@ -1,5 +1,6 @@
 use crate::{
     Checksum, Error, Frame, Transport,
+    strategy::IdAllocator,
     utils::{encode_be, fits_in_bytes, is_valid_width},
 };
 
@@ -10,10 +11,11 @@ pub(crate) struct MultipartTx<S: Copy> {
     pub data_checksum: S,
 }
 
-pub(crate) struct TxCore<T, K, const ID: usize, const LEN: usize, const TY: usize>
+pub(crate) struct TxCore<T, K, A, const ID: usize, const LEN: usize, const TY: usize>
 where
     T: Transport,
     K: Checksum,
+    A: IdAllocator,
 {
     pub transport: T,
     pub checksum: K,
@@ -22,12 +24,14 @@ where
     pub tx_busy: bool,
     pub multipart: Option<MultipartTx<K::Value>>,
     pub next_id: u32,
+    pub id_allocator: A,
 }
 
-impl<T, K, const ID: usize, const LEN: usize, const TY: usize> TxCore<T, K, ID, LEN, TY>
+impl<T, K, A, const ID: usize, const LEN: usize, const TY: usize> TxCore<T, K, A, ID, LEN, TY>
 where
     T: Transport,
     K: Checksum,
+    A: IdAllocator,
 {
     pub fn send(&mut self, mut frame: Frame, data: &[u8]) -> Result<(), Error<T::Error>> {
         if !is_valid_width(ID) || !is_valid_width(LEN) || !is_valid_width(TY) {
@@ -125,22 +129,9 @@ where
         result
     }
 
-    fn id_value_mask(&self) -> u32 {
-        (1u32 << (ID * 8 - 1)) - 1
-    }
-
-    fn id_peer_mask(&self) -> u32 {
-        1u32 << (ID * 8 - 1)
-    }
-
     fn alloc_id(&mut self) -> u32 {
-        let raw = self.next_id & self.id_value_mask();
-        self.next_id = self.next_id.wrapping_add(1) & self.id_value_mask();
-        if self.peer_master {
-            raw | self.id_peer_mask()
-        } else {
-            raw
-        }
+        self.id_allocator
+            .alloc_id::<ID>(&mut self.next_id, self.peer_master)
     }
 
     pub fn begin_multipart(&mut self, mut frame: Frame, len: u32) -> Result<u32, Error<T::Error>> {

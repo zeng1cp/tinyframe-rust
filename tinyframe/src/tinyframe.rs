@@ -4,6 +4,7 @@ use crate::{
     listener::{IdListener, ListenerId, TypeListener},
     parser::{ParseStage, Parser},
     rx_dispatch_core::RxDispatchCore,
+    strategy::{DispatchPolicy, IdThenTypeDispatch, SequentialIdAllocator},
     tx_core::TxCore,
     utils::{FieldKind, is_valid_width},
 };
@@ -18,19 +19,24 @@ pub struct TinyFrame<
     const ID: usize,
     const LEN: usize,
     const TY: usize,
+    A = SequentialIdAllocator,
+    D = IdThenTypeDispatch,
 > where
     T: Transport,
     K: Checksum,
+    A: crate::strategy::IdAllocator,
+    D: DispatchPolicy,
 {
     ctx: C,
-    tx: TxCore<T, K, ID, LEN, TY>,
+    tx: TxCore<T, K, A, ID, LEN, TY>,
     parser_timeout_ticks: u16,
     parser: Parser<K>,
     rx_buf: [u8; RX],
-    id_listeners: [Option<IdListener<C, T, K, ID, LEN, TY>>; IDS],
-    type_listeners: [Option<TypeListener<C, T, K, ID, LEN, TY>>; TYPES],
-    generic_listener: Option<FrameCallback<C, T, K, ID, LEN, TY>>,
+    id_listeners: [Option<IdListener<C, T, K, A, ID, LEN, TY>>; IDS],
+    type_listeners: [Option<TypeListener<C, T, K, A, ID, LEN, TY>>; TYPES],
+    generic_listener: Option<FrameCallback<C, T, K, A, ID, LEN, TY>>,
     last_parse_error: Option<ParseError>,
+    dispatch_policy: D,
 }
 
 impl<
@@ -43,10 +49,14 @@ impl<
     const ID: usize,
     const LEN: usize,
     const TY: usize,
-> TinyFrame<C, T, K, RX, IDS, TYPES, ID, LEN, TY>
+    A,
+    D,
+> TinyFrame<C, T, K, RX, IDS, TYPES, ID, LEN, TY, A, D>
 where
     T: Transport,
     K: Checksum,
+    A: crate::strategy::IdAllocator + Default,
+    D: DispatchPolicy + Default,
 {
     /// Create a TinyFrame engine instance.
     ///
@@ -80,6 +90,7 @@ where
                 tx_busy: false,
                 multipart: None,
                 next_id: 0,
+                id_allocator: A::default(),
             },
             parser_timeout_ticks,
             parser: Parser::default(),
@@ -88,6 +99,7 @@ where
             type_listeners: core::array::from_fn(|_| None),
             generic_listener: None,
             last_parse_error: None,
+            dispatch_policy: D::default(),
         })
     }
 
@@ -146,7 +158,7 @@ where
         &mut self,
         id: u32,
         timeout_ticks: u16,
-        on_frame: FrameCallback<C, T, K, ID, LEN, TY>,
+        on_frame: FrameCallback<C, T, K, A, ID, LEN, TY>,
     ) -> Result<ListenerId, Error<T::Error>> {
         let slot = self
             .id_listeners
@@ -166,7 +178,7 @@ where
     pub fn add_type_listener(
         &mut self,
         typ: u32,
-        on_frame: FrameCallback<C, T, K, ID, LEN, TY>,
+        on_frame: FrameCallback<C, T, K, A, ID, LEN, TY>,
     ) -> Result<ListenerId, Error<T::Error>> {
         let slot = self
             .type_listeners
@@ -178,7 +190,7 @@ where
     }
 
     /// Register a catch-all listener when no ID/type listener handled frame.
-    pub fn set_generic_listener(&mut self, cb: FrameCallback<C, T, K, ID, LEN, TY>) {
+    pub fn set_generic_listener(&mut self, cb: FrameCallback<C, T, K, A, ID, LEN, TY>) {
         self.generic_listener = Some(cb);
     }
 
@@ -441,6 +453,7 @@ where
         RxDispatchCore::dispatch(
             &mut self.ctx,
             &mut self.tx,
+            &self.dispatch_policy,
             &mut self.id_listeners,
             &mut self.type_listeners,
             self.generic_listener,
