@@ -69,8 +69,40 @@ where
     /// ```no_run
     /// use tinyframe::{TinyFrame, BufferTransport, NoChecksum};
     ///
+    /// // 1) 给出一个常用类型别名，隐藏复杂泛型参数。
     /// type Tf = TinyFrame<(), BufferTransport<256>, NoChecksum, 64, 4, 4, 1, 1, 1>;
+    /// // 2) 使用 new_simple 快速创建：默认 Master、SOF=0x01、超时 tick=10。
     /// let _tf = Tf::new_simple((), BufferTransport::new(), NoChecksum).unwrap();
+    /// ```
+    ///
+    /// # UART + CRC 示例（更接近嵌入式真实场景）
+    /// ```no_run
+    /// use tinyframe::{TinyFrame, Transport, Crc16};
+    ///
+    /// // 模拟一个 UART 发送后端（真实项目里可包一层串口驱动 HAL）。
+    /// struct UartTransport {
+    ///     tx_log: [u8; 512],
+    ///     len: usize,
+    /// }
+    ///
+    /// impl UartTransport {
+    ///     fn new() -> Self { Self { tx_log: [0; 512], len: 0 } }
+    /// }
+    ///
+    /// impl Transport for UartTransport {
+    ///     // 这里用 () 简化错误类型；真实项目可替换为串口驱动自己的错误枚举。
+    ///     type Error = ();
+    ///     fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+    ///         let n = core::cmp::min(bytes.len(), self.tx_log.len().saturating_sub(self.len));
+    ///         self.tx_log[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+    ///         self.len += n;
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// // 使用 CRC16 作为校验算法；字段宽度示例中 ID/LEN/TYPE 都是 1 字节。
+    /// type TfUart = TinyFrame<(), UartTransport, Crc16, 128, 4, 4, 1, 1, 1>;
+    /// let _tf = TfUart::new_simple((), UartTransport::new(), Crc16).unwrap();
     /// ```
     pub fn new_simple(
         ctx: C,
@@ -92,8 +124,58 @@ where
     /// ```no_run
     /// use tinyframe::{TinyFrame, BufferTransport, NoChecksum, Peer};
     ///
+    /// // 明确指定全部构造参数，适合需要精细控制场景。
     /// type Tf = TinyFrame<(), BufferTransport<256>, NoChecksum, 64, 4, 4, 1, 1, 1>;
+    /// // 参数解释：
+    /// // - Peer::Master: 本端角色
+    /// // - 0x01: 帧起始字节 SOF
+    /// // - 10: 解析超时 tick
     /// let _tf = Tf::new((), BufferTransport::new(), NoChecksum, Peer::Master, 0x01, 10).unwrap();
+    /// ```
+    ///
+    /// # 结合 UART 传输与 CRC32 校验
+    /// ```no_run
+    /// use tinyframe::{TinyFrame, Transport, Peer, Crc32};
+    ///
+    /// // 该示例展示如何把自定义传输层（UART）与 CRC 校验一起接入。
+    /// struct UartTransport {
+    ///     tx_log: [u8; 1024],
+    ///     len: usize,
+    /// }
+    ///
+    /// impl UartTransport {
+    ///     fn new() -> Self { Self { tx_log: [0; 1024], len: 0 } }
+    /// }
+    ///
+    /// impl Transport for UartTransport {
+    ///     type Error = ();
+    ///     fn begin_frame(&mut self) -> Result<(), Self::Error> {
+    ///         // 可选：例如拉高片选、打时间戳等。
+    ///         Ok(())
+    ///     }
+    ///     fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+    ///         let n = core::cmp::min(bytes.len(), self.tx_log.len().saturating_sub(self.len));
+    ///         self.tx_log[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+    ///         self.len += n;
+    ///         Ok(())
+    ///     }
+    ///     fn end_frame(&mut self) -> Result<(), Self::Error> {
+    ///         // 可选：例如 flush UART DMA。
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// // 这里选择 Crc32，接收缓冲区更大一些（RX=256）。
+    /// type TfUartCrc = TinyFrame<(), UartTransport, Crc32, 256, 8, 8, 1, 2, 1>;
+    ///
+    /// let _tf = TfUartCrc::new(
+    ///     (),                  // 用户上下文
+    ///     UartTransport::new(),// 自定义 UART 传输
+    ///     Crc32,               // CRC 校验策略
+    ///     Peer::Slave,         // 本端角色
+    ///     0xA5,                // SOF
+    ///     20,                  // parser 超时 tick
+    /// ).unwrap();
     /// ```
     pub fn new(
         ctx: C,
