@@ -16,6 +16,9 @@ mod parser;
 mod tx_core;
 mod channel;
 mod tinyframe;
+mod observer_store;
+mod rx_dispatch_core;
+mod rx_parser_core;
 mod utils;
 
 // 重新导出最常用的类型
