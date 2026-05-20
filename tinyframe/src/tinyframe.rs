@@ -2,11 +2,11 @@ use crate::{
     Checksum, Error, Frame, FrameCallback, FrameChannel, ParseError, Peer,
     ReceivedFrame, Transport,
     listener::{IdListener, ListenerId, TypeListener},
-    parser::{ParseStage, Parser},
     rx_dispatch_core::RxDispatchCore,
+    rx_parser_core::{ParsedFrameMeta, RxParserCore},
     strategy::{DispatchPolicy, IdThenTypeDispatch, SequentialIdAllocator},
     tx_core::TxCore,
-    utils::{FieldKind, is_valid_width},
+    utils::is_valid_width,
 };
 
 pub struct TinyFrame<
@@ -29,13 +29,10 @@ pub struct TinyFrame<
 {
     ctx: C,
     tx: TxCore<T, K, A, ID, LEN, TY>,
-    parser_timeout_ticks: u16,
-    parser: Parser<K>,
-    rx_buf: [u8; RX],
+    rx: RxParserCore<K, RX>,
     id_listeners: [Option<IdListener<C, T, K, A, ID, LEN, TY>>; IDS],
     type_listeners: [Option<TypeListener<C, T, K, A, ID, LEN, TY>>; TYPES],
     generic_listener: Option<FrameCallback<C, T, K, A, ID, LEN, TY>>,
-    last_parse_error: Option<ParseError>,
     dispatch_policy: D,
 }
 
@@ -204,13 +201,10 @@ where
                 next_id: 0,
                 id_allocator: A::default(),
             },
-            parser_timeout_ticks,
-            parser: Parser::default(),
-            rx_buf: [0; RX],
+            rx: RxParserCore::new(parser_timeout_ticks),
             id_listeners: core::array::from_fn(|_| None),
             type_listeners: core::array::from_fn(|_| None),
             generic_listener: None,
-            last_parse_error: None,
             dispatch_policy: D::default(),
         })
     }
@@ -229,7 +223,7 @@ where
     }
     /// Last parse error observed during `accept`/`accept_byte`.
     pub fn last_parse_error(&self) -> Option<ParseError> {
-        self.last_parse_error
+        self.rx.last_parse_error
     }
 
     /// Send an outbound frame.
@@ -363,12 +357,7 @@ where
 
     /// Tick parser and listener timeout state machine.
     pub fn tick(&mut self) {
-        if self.parser.timeout > 0 {
-            self.parser.timeout -= 1;
-            if self.parser.timeout == 0 {
-                self.reset_parser();
-            }
-        }
+        self.rx.tick();
 
         for i in 0..IDS {
             let mut entry = match self.id_listeners[i].take() {
@@ -397,7 +386,7 @@ where
 
     /// Reset incremental parser state.
     pub fn reset_parser(&mut self) {
-        self.parser = Parser::default();
+        self.rx.reset_parser();
     }
 
     /// Feed a byte slice into streaming parser.
@@ -409,167 +398,26 @@ where
 
     /// Feed one byte into streaming parser.
     pub fn accept_byte(&mut self, byte: u8) {
-        if self.parser.stage != ParseStage::Sof {
-            self.parser.timeout = self.parser_timeout_ticks;
-        }
-
-        match self.parser.stage {
-            ParseStage::Sof => {
-                if byte == self.tx.sof {
-                    self.parser = Parser {
-                        stage: ParseStage::Id,
-                        head_checksum: self.tx.checksum.start(),
-                        data_checksum: self.tx.checksum.start(),
-                        timeout: self.parser_timeout_ticks,
-                        ..Parser::default()
-                    };
-                }
-            }
-            ParseStage::Id => {
-                self.parse_field_byte(byte, ID, FieldKind::Id);
-            }
-            ParseStage::Len => {
-                self.parse_field_byte(byte, LEN, FieldKind::Len);
-            }
-            ParseStage::Type => {
-                self.parse_field_byte(byte, TY, FieldKind::Type);
-            }
-            ParseStage::Data => {
-                if self.parser.data_idx < RX {
-                    self.rx_buf[self.parser.data_idx] = byte;
-                }
-                self.parser.data_checksum = self.tx.checksum.add(self.parser.data_checksum, byte);
-                self.parser.data_idx += 1;
-                if self.parser.data_idx >= self.parser.len as usize {
-                    if K::WIDTH == 0 {
-                        self.dispatch_zero_copy();
-                        self.reset_parser();
-                    } else {
-                        self.parser.checksum_idx = 0;
-                        self.parser.stage = ParseStage::DataChecksum;
-                    }
-                }
-            }
-            ParseStage::HeadChecksum => {
-                if K::WIDTH == 0 {
-                    self.dispatch_zero_copy();
-                    self.reset_parser();
-                    return;
-                }
-                if self.parser.checksum_idx < self.parser.checksum_buf.len() {
-                    self.parser.checksum_buf[self.parser.checksum_idx] = byte;
-                }
-                self.parser.checksum_idx += 1;
-                if self.parser.checksum_idx >= K::WIDTH {
-                    let calc = self.tx.checksum.finish(self.parser.head_checksum);
-                    let recv = self
-                        .tx
-                        .checksum
-                        .decode(&self.parser.checksum_buf[..K::WIDTH]);
-                    if calc != recv {
-                        self.last_parse_error = Some(ParseError::ChecksumMismatch);
-                    } else {
-                        if self.parser.len == 0 {
-                            self.dispatch_zero_copy();
-                            self.reset_parser();
-                        } else {
-                            self.parser.stage = ParseStage::Data;
-                            self.parser.data_idx = 0;
-                            self.parser.data_checksum = self.tx.checksum.start();
-                        }
-                    }
-                }
-            }
-            ParseStage::DataChecksum => {
-                if self.parser.checksum_idx < self.parser.checksum_buf.len() {
-                    self.parser.checksum_buf[self.parser.checksum_idx] = byte;
-                }
-                self.parser.checksum_idx += 1;
-                if self.parser.checksum_idx >= K::WIDTH {
-                    let calc = self.tx.checksum.finish(self.parser.data_checksum);
-                    let recv = self
-                        .tx
-                        .checksum
-                        .decode(&self.parser.checksum_buf[..K::WIDTH]);
-                    if calc != recv {
-                        self.last_parse_error = Some(ParseError::ChecksumMismatch);
-                    } else {
-                        self.dispatch_zero_copy();
-                    }
-                    self.reset_parser();
-                }
-            }
-        }
-    }
-
-    fn parse_field_byte(&mut self, byte: u8, width: usize, target: FieldKind) {
-        // 1. 将当前字节纳入头部校验和计算
-        self.parser.head_checksum = self.tx.checksum.add(self.parser.head_checksum, byte);
-
-        // 2. 按大端序拼接字段值
-        let shift = ((width - 1 - self.parser.field_idx) * 8) as u32;
-        match target {
-            FieldKind::Len => self.parser.len |= (byte as u32) << shift,
-            FieldKind::Id => self.parser.id |= (byte as u32) << shift,
-            FieldKind::Type => self.parser.typ |= (byte as u32) << shift,
-        }
-        self.parser.field_idx += 1;
-
-        // 3. 若字段已完整接收，切换到下一阶段
-        if self.parser.field_idx >= width {
-            self.parser.field_idx = 0;
-            self.parser.stage = match target {
-                FieldKind::Id => ParseStage::Len,
-                FieldKind::Len => ParseStage::Type,
-                FieldKind::Type => {
-                    // TYPE 字段完成后，根据 LEN 决定走向
-                    if self.parser.len as usize > RX {
-                        // 载荷过大，记录错误并重置解析器
-                        self.last_parse_error = Some(ParseError::PayloadTooLarge);
-                        self.reset_parser();
-                        return;
-                    }
-                    if self.parser.len == 0 {
-                        // 无载荷：若校验和宽度为 0 则直接分发，否则进入头部校验和阶段
-                        if K::WIDTH == 0 {
-                            self.dispatch_zero_copy();
-                            self.reset_parser();
-                            return;
-                        }
-                        self.parser.checksum_idx = 0;
-                        ParseStage::HeadChecksum
-                    } else {
-                        // 有载荷：同样根据校验和宽度决定是否先进行头部校验
-                        if K::WIDTH == 0 {
-                            self.parser.data_idx = 0;
-                            self.parser.data_checksum = self.tx.checksum.start();
-                            ParseStage::Data
-                        } else {
-                            self.parser.checksum_idx = 0;
-                            ParseStage::HeadChecksum
-                        }
-                    }
-                }
+        let frame = self
+            .rx
+            .accept_byte(byte, self.tx.sof, &self.tx.checksum, (ID, LEN, TY));
+        if let Some(ParsedFrameMeta { id, typ, len }) = frame {
+            let frame = ReceivedFrame {
+                id,
+                typ,
+                data: &self.rx.rx_buf[..len],
+                timed_out: false,
             };
+            RxDispatchCore::dispatch(
+                &mut self.ctx,
+                &mut self.tx,
+                &self.dispatch_policy,
+                &mut self.id_listeners,
+                &mut self.type_listeners,
+                self.generic_listener,
+                frame,
+            );
+            self.rx.reset_parser();
         }
-    }
-
-    fn dispatch_zero_copy(&mut self) {
-        let frame = ReceivedFrame {
-            id: self.parser.id,
-            typ: self.parser.typ,
-            data: &self.rx_buf[..self.parser.len as usize],
-            timed_out: false,
-        };
-
-        RxDispatchCore::dispatch(
-            &mut self.ctx,
-            &mut self.tx,
-            &self.dispatch_policy,
-            &mut self.id_listeners,
-            &mut self.type_listeners,
-            self.generic_listener,
-            frame,
-        );
     }
 }
