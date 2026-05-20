@@ -1,9 +1,9 @@
-use crate::{Checksum, FrameChannel, ReceivedFrame, Transport};
+use crate::{Checksum, FrameChannel, ReceivedFrame, Transport, strategy::IdAllocator};
 
 pub type ListenerId = usize;
 
-pub type FrameCallback<C, T, K, const ID: usize, const LEN: usize, const TY: usize> =
-    fn(&mut C, &mut FrameChannel<'_, T, K, ID, LEN, TY>, ReceivedFrame<'_>) -> ListenerAction;
+pub type FrameCallback<C, T, K, A, const ID: usize, const LEN: usize, const TY: usize> =
+    fn(&mut C, &mut FrameChannel<'_, T, K, ID, LEN, TY, A>, ReceivedFrame<'_>) -> ListenerAction;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListenerAction {
@@ -18,23 +18,25 @@ pub enum ListenerAction {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct IdListener<C, T, K, const ID: usize, const LEN: usize, const TY: usize>
+pub(crate) struct IdListener<C, T, K, A, const ID: usize, const LEN: usize, const TY: usize>
 where
     T: Transport,
     K: Checksum,
+    A: IdAllocator,
 {
     pub id: u32,
     pub timeout_left: u16,
     pub timeout_max: u16,
-    pub on_frame: FrameCallback<C, T, K, ID, LEN, TY>,
+    pub on_frame: FrameCallback<C, T, K, A, ID, LEN, TY>,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct TypeListener<C, T, K, const ID: usize, const LEN: usize, const TY: usize>
+pub(crate) struct TypeListener<C, T, K, A, const ID: usize, const LEN: usize, const TY: usize>
 where
     T: Transport,
     K: Checksum,
+    A: IdAllocator,
 {
     pub typ: u32,
-    pub on_frame: FrameCallback<C, T, K, ID, LEN, TY>,
+    pub on_frame: FrameCallback<C, T, K, A, ID, LEN, TY>,
 }
