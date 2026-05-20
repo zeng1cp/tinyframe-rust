@@ -1,8 +1,10 @@
 use crate::{
-    Checksum, Error, Frame, FrameCallback, FrameChannel, ListenerAction, ParseError, Peer,
+    Checksum, Error, Frame, FrameCallback, FrameChannel, ParseError, Peer,
     ReceivedFrame, Transport,
     listener::{IdListener, ListenerId, TypeListener},
     parser::{ParseStage, Parser},
+    rx_dispatch_core::RxDispatchCore,
+    strategy::{DispatchPolicy, IdThenTypeDispatch, SequentialIdAllocator},
     tx_core::TxCore,
     utils::{FieldKind, is_valid_width},
 };
@@ -17,19 +19,24 @@ pub struct TinyFrame<
     const ID: usize,
     const LEN: usize,
     const TY: usize,
+    A = SequentialIdAllocator,
+    D = IdThenTypeDispatch,
 > where
     T: Transport,
     K: Checksum,
+    A: crate::strategy::IdAllocator,
+    D: DispatchPolicy,
 {
     ctx: C,
-    tx: TxCore<T, K, ID, LEN, TY>,
+    tx: TxCore<T, K, A, ID, LEN, TY>,
     parser_timeout_ticks: u16,
     parser: Parser<K>,
     rx_buf: [u8; RX],
-    id_listeners: [Option<IdListener<C, T, K, ID, LEN, TY>>; IDS],
-    type_listeners: [Option<TypeListener<C, T, K, ID, LEN, TY>>; TYPES],
-    generic_listener: Option<FrameCallback<C, T, K, ID, LEN, TY>>,
+    id_listeners: [Option<IdListener<C, T, K, A, ID, LEN, TY>>; IDS],
+    type_listeners: [Option<TypeListener<C, T, K, A, ID, LEN, TY>>; TYPES],
+    generic_listener: Option<FrameCallback<C, T, K, A, ID, LEN, TY>>,
     last_parse_error: Option<ParseError>,
+    dispatch_policy: D,
 }
 
 impl<
@@ -42,11 +49,69 @@ impl<
     const ID: usize,
     const LEN: usize,
     const TY: usize,
-> TinyFrame<C, T, K, RX, IDS, TYPES, ID, LEN, TY>
+    A,
+    D,
+> TinyFrame<C, T, K, RX, IDS, TYPES, ID, LEN, TY, A, D>
 where
     T: Transport,
     K: Checksum,
+    A: crate::strategy::IdAllocator + Default,
+    D: DispatchPolicy + Default,
 {
+    /// Create a `TinyFrame` with default façade parameters.
+    ///
+    /// Defaults:
+    /// - `peer`: `Peer::Master`
+    /// - `sof`: `0x01`
+    /// - `parser_timeout_ticks`: `10`
+    ///
+    /// # Example
+    /// ```no_run
+    /// use tinyframe::{TinyFrame, BufferTransport, NoChecksum};
+    ///
+    /// // 1) 给出一个常用类型别名，隐藏复杂泛型参数。
+    /// type Tf = TinyFrame<(), BufferTransport<256>, NoChecksum, 64, 4, 4, 1, 1, 1>;
+    /// // 2) 使用 new_simple 快速创建：默认 Master、SOF=0x01、超时 tick=10。
+    /// let _tf = Tf::new_simple((), BufferTransport::new(), NoChecksum).unwrap();
+    /// ```
+    ///
+    /// # UART + CRC 示例（更接近嵌入式真实场景）
+    /// ```no_run
+    /// use tinyframe::{TinyFrame, Transport, Crc16};
+    ///
+    /// // 模拟一个 UART 发送后端（真实项目里可包一层串口驱动 HAL）。
+    /// struct UartTransport {
+    ///     tx_log: [u8; 512],
+    ///     len: usize,
+    /// }
+    ///
+    /// impl UartTransport {
+    ///     fn new() -> Self { Self { tx_log: [0; 512], len: 0 } }
+    /// }
+    ///
+    /// impl Transport for UartTransport {
+    ///     // 这里用 () 简化错误类型；真实项目可替换为串口驱动自己的错误枚举。
+    ///     type Error = ();
+    ///     fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+    ///         let n = core::cmp::min(bytes.len(), self.tx_log.len().saturating_sub(self.len));
+    ///         self.tx_log[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+    ///         self.len += n;
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// // 使用 CRC16 作为校验算法；字段宽度示例中 ID/LEN/TYPE 都是 1 字节。
+    /// type TfUart = TinyFrame<(), UartTransport, Crc16, 128, 4, 4, 1, 1, 1>;
+    /// let _tf = TfUart::new_simple((), UartTransport::new(), Crc16).unwrap();
+    /// ```
+    pub fn new_simple(
+        ctx: C,
+        transport: T,
+        checksum: K,
+    ) -> Result<Self, Error<T::Error>> {
+        Self::new(ctx, transport, checksum, Peer::Master, 0x01, 10)
+    }
+
     /// Create a TinyFrame engine instance.
     ///
     /// # Type Parameters
@@ -54,6 +119,64 @@ where
     /// - `IDS`: ID listener slot count.
     /// - `TYPES`: type listener slot count.
     /// - `ID`/`LEN`/`TY`: encoded field widths in bytes (1..=4).
+    ///
+    /// # Example
+    /// ```no_run
+    /// use tinyframe::{TinyFrame, BufferTransport, NoChecksum, Peer};
+    ///
+    /// // 明确指定全部构造参数，适合需要精细控制场景。
+    /// type Tf = TinyFrame<(), BufferTransport<256>, NoChecksum, 64, 4, 4, 1, 1, 1>;
+    /// // 参数解释：
+    /// // - Peer::Master: 本端角色
+    /// // - 0x01: 帧起始字节 SOF
+    /// // - 10: 解析超时 tick
+    /// let _tf = Tf::new((), BufferTransport::new(), NoChecksum, Peer::Master, 0x01, 10).unwrap();
+    /// ```
+    ///
+    /// # 结合 UART 传输与 CRC32 校验
+    /// ```no_run
+    /// use tinyframe::{TinyFrame, Transport, Peer, Crc32};
+    ///
+    /// // 该示例展示如何把自定义传输层（UART）与 CRC 校验一起接入。
+    /// struct UartTransport {
+    ///     tx_log: [u8; 1024],
+    ///     len: usize,
+    /// }
+    ///
+    /// impl UartTransport {
+    ///     fn new() -> Self { Self { tx_log: [0; 1024], len: 0 } }
+    /// }
+    ///
+    /// impl Transport for UartTransport {
+    ///     type Error = ();
+    ///     fn begin_frame(&mut self) -> Result<(), Self::Error> {
+    ///         // 可选：例如拉高片选、打时间戳等。
+    ///         Ok(())
+    ///     }
+    ///     fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+    ///         let n = core::cmp::min(bytes.len(), self.tx_log.len().saturating_sub(self.len));
+    ///         self.tx_log[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+    ///         self.len += n;
+    ///         Ok(())
+    ///     }
+    ///     fn end_frame(&mut self) -> Result<(), Self::Error> {
+    ///         // 可选：例如 flush UART DMA。
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// // 这里选择 Crc32，接收缓冲区更大一些（RX=256）。
+    /// type TfUartCrc = TinyFrame<(), UartTransport, Crc32, 256, 8, 8, 1, 2, 1>;
+    ///
+    /// let _tf = TfUartCrc::new(
+    ///     (),                  // 用户上下文
+    ///     UartTransport::new(),// 自定义 UART 传输
+    ///     Crc32,               // CRC 校验策略
+    ///     Peer::Slave,         // 本端角色
+    ///     0xA5,                // SOF
+    ///     20,                  // parser 超时 tick
+    /// ).unwrap();
+    /// ```
     pub fn new(
         ctx: C,
         transport: T,
@@ -79,6 +202,7 @@ where
                 tx_busy: false,
                 multipart: None,
                 next_id: 0,
+                id_allocator: A::default(),
             },
             parser_timeout_ticks,
             parser: Parser::default(),
@@ -87,6 +211,7 @@ where
             type_listeners: core::array::from_fn(|_| None),
             generic_listener: None,
             last_parse_error: None,
+            dispatch_policy: D::default(),
         })
     }
 
@@ -145,7 +270,7 @@ where
         &mut self,
         id: u32,
         timeout_ticks: u16,
-        on_frame: FrameCallback<C, T, K, ID, LEN, TY>,
+        on_frame: FrameCallback<C, T, K, A, ID, LEN, TY>,
     ) -> Result<ListenerId, Error<T::Error>> {
         let slot = self
             .id_listeners
@@ -165,7 +290,7 @@ where
     pub fn add_type_listener(
         &mut self,
         typ: u32,
-        on_frame: FrameCallback<C, T, K, ID, LEN, TY>,
+        on_frame: FrameCallback<C, T, K, A, ID, LEN, TY>,
     ) -> Result<ListenerId, Error<T::Error>> {
         let slot = self
             .type_listeners
@@ -177,7 +302,7 @@ where
     }
 
     /// Register a catch-all listener when no ID/type listener handled frame.
-    pub fn set_generic_listener(&mut self, cb: FrameCallback<C, T, K, ID, LEN, TY>) {
+    pub fn set_generic_listener(&mut self, cb: FrameCallback<C, T, K, A, ID, LEN, TY>) {
         self.generic_listener = Some(cb);
     }
 
@@ -437,42 +562,14 @@ where
             timed_out: false,
         };
 
-        let mut channel = FrameChannel { tx: &mut self.tx };
-        let mut handled = false;
-
-        // 1. 优先匹配 ID 监听器（点对点请求/响应）
-        for slot in &mut self.id_listeners {
-            if let Some(listener) = slot.as_mut() {
-                if listener.id == frame.id {
-                    handled = true;
-                    match (listener.on_frame)(&mut self.ctx, &mut channel, frame) {
-                        ListenerAction::Close => *slot = None,
-                        ListenerAction::Renew => listener.timeout_left = listener.timeout_max,
-                        ListenerAction::Stay | ListenerAction::Next => {}
-                    }
-                }
-            }
-        }
-
-        // 2. 其次匹配类型监听器（按消息类型处理）
-        for slot in &mut self.type_listeners {
-            if let Some(listener) = slot.as_mut() {
-                if listener.typ == frame.typ {
-                    handled = true;
-                    if let ListenerAction::Close =
-                        (listener.on_frame)(&mut self.ctx, &mut channel, frame)
-                    {
-                        *slot = None;
-                    }
-                }
-            }
-        }
-
-        // 3. 若未被处理，则调用通用监听器（catch-all）
-        if !handled {
-            if let Some(cb) = self.generic_listener {
-                cb(&mut self.ctx, &mut channel, frame);
-            }
-        }
+        RxDispatchCore::dispatch(
+            &mut self.ctx,
+            &mut self.tx,
+            &self.dispatch_policy,
+            &mut self.id_listeners,
+            &mut self.type_listeners,
+            self.generic_listener,
+            frame,
+        );
     }
 }
