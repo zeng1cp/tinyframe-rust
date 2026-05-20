@@ -14,6 +14,7 @@ mod checksum;
 mod transport;
 mod parser;
 mod tx_core;
+mod tx_pipeline;
 mod channel;
 mod tinyframe;
 mod observer_store;
@@ -32,4 +33,3 @@ pub use transport::{Transport, BufferTransport};
 pub use channel::FrameChannel;
 pub use strategy::{DispatchPolicy, IdAllocator, IdThenTypeDispatch, SequentialIdAllocator};
 pub use tinyframe::TinyFrame;
-

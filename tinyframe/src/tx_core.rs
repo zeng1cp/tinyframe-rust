@@ -1,7 +1,8 @@
 use crate::{
     Checksum, Error, Frame, Transport,
     strategy::IdAllocator,
-    utils::{encode_be, fits_in_bytes, is_valid_width},
+    tx_pipeline::TxPipeline,
+    utils::{fits_in_bytes, is_valid_width},
 };
 
 #[derive(Clone, Copy)]
@@ -62,48 +63,15 @@ where
 
         self.tx_busy = true;
         let result = (|| {
-            self.transport.begin_frame().map_err(Error::Transport)?;
-
-            // SOF is transport framing and is not part of checksum.
-            let mut head_csum = self.checksum.start();
-            self.transport
-                .write(&[self.sof])
-                .map_err(Error::Transport)?;
-
-            let mut field_buf = [0u8; 4];
-            // TinyFrame header field order: ID, LEN, TYPE.
-            encode_be(frame.id, ID, &mut field_buf);
-            self.transport
-                .write(&field_buf[..ID])
-                .map_err(Error::Transport)?;
-            for &b in &field_buf[..ID] {
-                head_csum = self.checksum.add(head_csum, b);
-            }
-
-            encode_be(len_u32, LEN, &mut field_buf);
-            self.transport
-                .write(&field_buf[..LEN])
-                .map_err(Error::Transport)?;
-            for &b in &field_buf[..LEN] {
-                head_csum = self.checksum.add(head_csum, b);
-            }
-
-            encode_be(frame.typ, TY, &mut field_buf);
-            self.transport
-                .write(&field_buf[..TY])
-                .map_err(Error::Transport)?;
-            for &b in &field_buf[..TY] {
-                head_csum = self.checksum.add(head_csum, b);
-            }
-
-            let sum = self.checksum.finish(head_csum);
-            if K::WIDTH > 0 {
-                let mut cksum_buf = [0u8; 4];
-                let used = self.checksum.encode(sum, &mut cksum_buf);
-                self.transport
-                    .write(&cksum_buf[..used])
-                    .map_err(Error::Transport)?;
-            }
+            let head_csum = TxPipeline::write_header::<T, K, ID, LEN, TY>(
+                &mut self.transport,
+                &self.checksum,
+                self.sof,
+                frame.id,
+                len_u32,
+                frame.typ,
+            )?;
+            TxPipeline::write_checksum(&mut self.transport, &self.checksum, head_csum)?;
 
             self.transport.write(data).map_err(Error::Transport)?;
             if K::WIDTH > 0 && !data.is_empty() {
@@ -154,45 +122,15 @@ where
         let result = (|| {
             self.transport.begin_frame().map_err(Error::Transport)?;
 
-            let mut head_csum = self.checksum.start();
-            self.transport
-                .write(&[self.sof])
-                .map_err(Error::Transport)?;
-
-            let mut field_buf = [0u8; 4];
-            encode_be(frame.id, ID, &mut field_buf);
-            self.transport
-                .write(&field_buf[..ID])
-                .map_err(Error::Transport)?;
-            for &b in &field_buf[..ID] {
-                head_csum = self.checksum.add(head_csum, b);
-            }
-
-            encode_be(len, LEN, &mut field_buf);
-            self.transport
-                .write(&field_buf[..LEN])
-                .map_err(Error::Transport)?;
-            for &b in &field_buf[..LEN] {
-                head_csum = self.checksum.add(head_csum, b);
-            }
-
-            encode_be(frame.typ, TY, &mut field_buf);
-            self.transport
-                .write(&field_buf[..TY])
-                .map_err(Error::Transport)?;
-            for &b in &field_buf[..TY] {
-                head_csum = self.checksum.add(head_csum, b);
-            }
-
-            if K::WIDTH > 0 {
-                let mut cksum_buf = [0u8; 4];
-                let used = self
-                    .checksum
-                    .encode(self.checksum.finish(head_csum), &mut cksum_buf);
-                self.transport
-                    .write(&cksum_buf[..used])
-                    .map_err(Error::Transport)?;
-            }
+            let head_csum = TxPipeline::write_header::<T, K, ID, LEN, TY>(
+                &mut self.transport,
+                &self.checksum,
+                self.sof,
+                frame.id,
+                len,
+                frame.typ,
+            )?;
+            TxPipeline::write_checksum(&mut self.transport, &self.checksum, head_csum)?;
 
             self.multipart = Some(MultipartTx {
                 expected_len: len,
