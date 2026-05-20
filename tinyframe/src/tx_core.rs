@@ -1,6 +1,8 @@
 use crate::{
     Checksum, Error, Frame, Transport,
-    utils::{encode_be, fits_in_bytes, is_valid_width},
+    strategy::IdAllocator,
+    tx_pipeline::TxPipeline,
+    utils::{fits_in_bytes, is_valid_width},
 };
 
 #[derive(Clone, Copy)]
@@ -10,10 +12,11 @@ pub(crate) struct MultipartTx<S: Copy> {
     pub data_checksum: S,
 }
 
-pub(crate) struct TxCore<T, K, const ID: usize, const LEN: usize, const TY: usize>
+pub(crate) struct TxCore<T, K, A, const ID: usize, const LEN: usize, const TY: usize>
 where
     T: Transport,
     K: Checksum,
+    A: IdAllocator,
 {
     pub transport: T,
     pub checksum: K,
@@ -22,12 +25,14 @@ where
     pub tx_busy: bool,
     pub multipart: Option<MultipartTx<K::Value>>,
     pub next_id: u32,
+    pub id_allocator: A,
 }
 
-impl<T, K, const ID: usize, const LEN: usize, const TY: usize> TxCore<T, K, ID, LEN, TY>
+impl<T, K, A, const ID: usize, const LEN: usize, const TY: usize> TxCore<T, K, A, ID, LEN, TY>
 where
     T: Transport,
     K: Checksum,
+    A: IdAllocator,
 {
     pub fn send(&mut self, mut frame: Frame, data: &[u8]) -> Result<(), Error<T::Error>> {
         if !is_valid_width(ID) || !is_valid_width(LEN) || !is_valid_width(TY) {
@@ -58,48 +63,15 @@ where
 
         self.tx_busy = true;
         let result = (|| {
-            self.transport.begin_frame().map_err(Error::Transport)?;
-
-            // SOF is transport framing and is not part of checksum.
-            let mut head_csum = self.checksum.start();
-            self.transport
-                .write(&[self.sof])
-                .map_err(Error::Transport)?;
-
-            let mut field_buf = [0u8; 4];
-            // TinyFrame header field order: ID, LEN, TYPE.
-            encode_be(frame.id, ID, &mut field_buf);
-            self.transport
-                .write(&field_buf[..ID])
-                .map_err(Error::Transport)?;
-            for &b in &field_buf[..ID] {
-                head_csum = self.checksum.add(head_csum, b);
-            }
-
-            encode_be(len_u32, LEN, &mut field_buf);
-            self.transport
-                .write(&field_buf[..LEN])
-                .map_err(Error::Transport)?;
-            for &b in &field_buf[..LEN] {
-                head_csum = self.checksum.add(head_csum, b);
-            }
-
-            encode_be(frame.typ, TY, &mut field_buf);
-            self.transport
-                .write(&field_buf[..TY])
-                .map_err(Error::Transport)?;
-            for &b in &field_buf[..TY] {
-                head_csum = self.checksum.add(head_csum, b);
-            }
-
-            let sum = self.checksum.finish(head_csum);
-            if K::WIDTH > 0 {
-                let mut cksum_buf = [0u8; 4];
-                let used = self.checksum.encode(sum, &mut cksum_buf);
-                self.transport
-                    .write(&cksum_buf[..used])
-                    .map_err(Error::Transport)?;
-            }
+            let head_csum = TxPipeline::write_header::<T, K, ID, LEN, TY>(
+                &mut self.transport,
+                &self.checksum,
+                self.sof,
+                frame.id,
+                len_u32,
+                frame.typ,
+            )?;
+            TxPipeline::write_checksum(&mut self.transport, &self.checksum, head_csum)?;
 
             self.transport.write(data).map_err(Error::Transport)?;
             if K::WIDTH > 0 && !data.is_empty() {
@@ -125,22 +97,9 @@ where
         result
     }
 
-    fn id_value_mask(&self) -> u32 {
-        (1u32 << (ID * 8 - 1)) - 1
-    }
-
-    fn id_peer_mask(&self) -> u32 {
-        1u32 << (ID * 8 - 1)
-    }
-
     fn alloc_id(&mut self) -> u32 {
-        let raw = self.next_id & self.id_value_mask();
-        self.next_id = self.next_id.wrapping_add(1) & self.id_value_mask();
-        if self.peer_master {
-            raw | self.id_peer_mask()
-        } else {
-            raw
-        }
+        self.id_allocator
+            .alloc_id::<ID>(&mut self.next_id, self.peer_master)
     }
 
     pub fn begin_multipart(&mut self, mut frame: Frame, len: u32) -> Result<u32, Error<T::Error>> {
@@ -163,45 +122,15 @@ where
         let result = (|| {
             self.transport.begin_frame().map_err(Error::Transport)?;
 
-            let mut head_csum = self.checksum.start();
-            self.transport
-                .write(&[self.sof])
-                .map_err(Error::Transport)?;
-
-            let mut field_buf = [0u8; 4];
-            encode_be(frame.id, ID, &mut field_buf);
-            self.transport
-                .write(&field_buf[..ID])
-                .map_err(Error::Transport)?;
-            for &b in &field_buf[..ID] {
-                head_csum = self.checksum.add(head_csum, b);
-            }
-
-            encode_be(len, LEN, &mut field_buf);
-            self.transport
-                .write(&field_buf[..LEN])
-                .map_err(Error::Transport)?;
-            for &b in &field_buf[..LEN] {
-                head_csum = self.checksum.add(head_csum, b);
-            }
-
-            encode_be(frame.typ, TY, &mut field_buf);
-            self.transport
-                .write(&field_buf[..TY])
-                .map_err(Error::Transport)?;
-            for &b in &field_buf[..TY] {
-                head_csum = self.checksum.add(head_csum, b);
-            }
-
-            if K::WIDTH > 0 {
-                let mut cksum_buf = [0u8; 4];
-                let used = self
-                    .checksum
-                    .encode(self.checksum.finish(head_csum), &mut cksum_buf);
-                self.transport
-                    .write(&cksum_buf[..used])
-                    .map_err(Error::Transport)?;
-            }
+            let head_csum = TxPipeline::write_header::<T, K, ID, LEN, TY>(
+                &mut self.transport,
+                &self.checksum,
+                self.sof,
+                frame.id,
+                len,
+                frame.typ,
+            )?;
+            TxPipeline::write_checksum(&mut self.transport, &self.checksum, head_csum)?;
 
             self.multipart = Some(MultipartTx {
                 expected_len: len,
