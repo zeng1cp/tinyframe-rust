@@ -18,7 +18,7 @@ pub enum ListenerAction {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct IdListener<C, T, K, A, const ID: usize, const LEN: usize, const TY: usize>
+pub struct IdListener<C, T, K, A, const ID: usize, const LEN: usize, const TY: usize>
 where
     T: Transport,
     K: Checksum,
@@ -31,7 +31,7 @@ where
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct TypeListener<C, T, K, A, const ID: usize, const LEN: usize, const TY: usize>
+pub struct TypeListener<C, T, K, A, const ID: usize, const LEN: usize, const TY: usize>
 where
     T: Transport,
     K: Checksum,
