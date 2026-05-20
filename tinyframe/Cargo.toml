@@ -1,0 +1,15 @@
+[package]
+name = "tinyframe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+
+[features]
+default = []
+std = []  # 用于测试时启用标准库
+
+[lib]
+test = false
+bench = false

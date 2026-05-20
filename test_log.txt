@@ -1,0 +1,13 @@
+[query] TX: aa0205237175657279[timeout] TX: aa0408ff6e6f207265706c79
+[echo] TX: aa010c2248656c6c6f2c206563686f21[multipart] TX: aa030524
+
+
+[query] RX: aa020423706f6e67
+[query] ✅ 通过
+[echo] RX: aa010c2248656c6c6f2c206563686f21
+[echo] ✅ 通过
+[multipart] TX: 0102
+[multipart] TX: 030405
+[multipart] RX: aa0302244f4b
+[multipart] ✅ 通过
+[timeout] ✅ 通过
