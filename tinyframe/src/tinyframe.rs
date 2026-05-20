@@ -1,7 +1,8 @@
 use crate::{
     Checksum, Error, Frame, FrameCallback, FrameChannel, ParseError, Peer,
     ReceivedFrame, Transport,
-    listener::{IdListener, ListenerId, TypeListener},
+    listener::ListenerId,
+    observer_store::ObserverStore,
     rx_dispatch_core::RxDispatchCore,
     rx_parser_core::{ParsedFrameMeta, RxParserCore},
     strategy::{DispatchPolicy, IdThenTypeDispatch, SequentialIdAllocator},
@@ -30,9 +31,7 @@ pub struct TinyFrame<
     ctx: C,
     tx: TxCore<T, K, A, ID, LEN, TY>,
     rx: RxParserCore<K, RX>,
-    id_listeners: [Option<IdListener<C, T, K, A, ID, LEN, TY>>; IDS],
-    type_listeners: [Option<TypeListener<C, T, K, A, ID, LEN, TY>>; TYPES],
-    generic_listener: Option<FrameCallback<C, T, K, A, ID, LEN, TY>>,
+    observers: ObserverStore<C, T, K, A, IDS, TYPES, ID, LEN, TY>,
     dispatch_policy: D,
 }
 
@@ -202,9 +201,7 @@ where
                 id_allocator: A::default(),
             },
             rx: RxParserCore::new(parser_timeout_ticks),
-            id_listeners: core::array::from_fn(|_| None),
-            type_listeners: core::array::from_fn(|_| None),
-            generic_listener: None,
+            observers: ObserverStore::new(),
             dispatch_policy: D::default(),
         })
     }
@@ -266,18 +263,7 @@ where
         timeout_ticks: u16,
         on_frame: FrameCallback<C, T, K, A, ID, LEN, TY>,
     ) -> Result<ListenerId, Error<T::Error>> {
-        let slot = self
-            .id_listeners
-            .iter()
-            .position(|x| x.is_none())
-            .ok_or(Error::NoListenerSlot)?;
-        self.id_listeners[slot] = Some(IdListener {
-            id,
-            timeout_left: timeout_ticks,
-            timeout_max: timeout_ticks,
-            on_frame,
-        });
-        Ok(slot)
+        self.observers.add_id_listener(id, timeout_ticks, on_frame)
     }
 
     /// Register a type-based listener.
@@ -286,102 +272,51 @@ where
         typ: u32,
         on_frame: FrameCallback<C, T, K, A, ID, LEN, TY>,
     ) -> Result<ListenerId, Error<T::Error>> {
-        let slot = self
-            .type_listeners
-            .iter()
-            .position(|x| x.is_none())
-            .ok_or(Error::NoListenerSlot)?;
-        self.type_listeners[slot] = Some(TypeListener { typ, on_frame });
-        Ok(slot)
+        self.observers.add_type_listener(typ, on_frame)
     }
 
     /// Register a catch-all listener when no ID/type listener handled frame.
     pub fn set_generic_listener(&mut self, cb: FrameCallback<C, T, K, A, ID, LEN, TY>) {
-        self.generic_listener = Some(cb);
+        self.observers.generic_listener = Some(cb);
     }
 
     pub fn clear_generic_listener(&mut self) {
-        self.generic_listener = None;
+        self.observers.generic_listener = None;
     }
 
     /// Remove an ID listener by slot index.
     pub fn remove_id_listener(&mut self, listener_id: ListenerId) -> bool {
-        if listener_id >= IDS {
-            return false;
-        }
-        self.id_listeners[listener_id].take().is_some()
+        self.observers.remove_id_listener(listener_id)
     }
 
     /// Remove an ID listener by frame ID.
     pub fn remove_id_listener_by_frame_id(&mut self, frame_id: u32) -> bool {
-        for slot in &mut self.id_listeners {
-            if slot.as_ref().map(|x| x.id == frame_id).unwrap_or(false) {
-                *slot = None;
-                return true;
-            }
-        }
-        false
+        self.observers.remove_id_listener_by_frame_id(frame_id)
     }
 
     /// Remove a type listener by slot index.
     pub fn remove_type_listener(&mut self, listener_id: ListenerId) -> bool {
-        if listener_id >= TYPES {
-            return false;
-        }
-        self.type_listeners[listener_id].take().is_some()
+        self.observers.remove_type_listener(listener_id)
     }
 
     /// Remove a type listener by message type.
     pub fn remove_type_listener_by_type(&mut self, typ: u32) -> bool {
-        for slot in &mut self.type_listeners {
-            if slot.as_ref().map(|x| x.typ == typ).unwrap_or(false) {
-                *slot = None;
-                return true;
-            }
-        }
-        false
+        self.observers.remove_type_listener_by_type(typ)
     }
 
     /// Renew timeout for an ID listener matched by frame ID.
     pub fn renew_id_listener(&mut self, frame_id: u32) -> bool {
-        for slot in &mut self.id_listeners {
-            if let Some(listener) = slot {
-                if listener.id == frame_id {
-                    listener.timeout_left = listener.timeout_max;
-                    return true;
-                }
-            }
-        }
-        false
+        self.observers.renew_id_listener(frame_id)
     }
 
     /// Tick parser and listener timeout state machine.
     pub fn tick(&mut self) {
         self.rx.tick();
 
-        for i in 0..IDS {
-            let mut entry = match self.id_listeners[i].take() {
-                Some(e) => e,
-                None => continue,
-            };
-
-            if entry.timeout_left > 0 {
-                entry.timeout_left -= 1;
-                if entry.timeout_left == 0 {
-                    let frame = ReceivedFrame {
-                        id: entry.id,
-                        typ: 0,
-                        data: &[],
-                        timed_out: true,
-                    };
-                    let mut channel = FrameChannel { tx: &mut self.tx };
-                    let _ = (entry.on_frame)(&mut self.ctx, &mut channel, frame);
-                    continue;
-                }
-            }
-
-            self.id_listeners[i] = Some(entry);
-        }
+        self.observers.tick_timeouts(|frame, cb| {
+            let mut channel = FrameChannel { tx: &mut self.tx };
+            let _ = cb(&mut self.ctx, &mut channel, frame);
+        });
     }
 
     /// Reset incremental parser state.
@@ -412,9 +347,9 @@ where
                 &mut self.ctx,
                 &mut self.tx,
                 &self.dispatch_policy,
-                &mut self.id_listeners,
-                &mut self.type_listeners,
-                self.generic_listener,
+                &mut self.observers.id_listeners,
+                &mut self.observers.type_listeners,
+                self.observers.generic_listener,
                 frame,
             );
             self.rx.reset_parser();
