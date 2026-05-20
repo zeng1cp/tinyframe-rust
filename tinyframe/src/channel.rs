@@ -1,18 +1,20 @@
-use crate::{Checksum, Error, Frame, ReceivedFrame, Transport, tx_core::TxCore};
+use crate::{Checksum, Error, Frame, ReceivedFrame, Transport, strategy::{IdAllocator, SequentialIdAllocator}, tx_core::TxCore};
 
-pub struct FrameChannel<'a, T, K, const ID: usize, const LEN: usize, const TY: usize>
+pub struct FrameChannel<'a, T, K, const ID: usize, const LEN: usize, const TY: usize, A = SequentialIdAllocator>
 where
     T: Transport,
     K: Checksum,
+    A: IdAllocator,
 {
-    pub(crate) tx: &'a mut TxCore<T, K, ID, LEN, TY>,
+    pub(crate) tx: &'a mut TxCore<T, K, A, ID, LEN, TY>,
 }
 
-impl<'a, T, K, const ID: usize, const LEN: usize, const TY: usize>
-    FrameChannel<'a, T, K, ID, LEN, TY>
+impl<'a, T, K, A, const ID: usize, const LEN: usize, const TY: usize>
+    FrameChannel<'a, T, K, ID, LEN, TY, A>
 where
     T: Transport,
     K: Checksum,
+    A: IdAllocator,
 {
     /// Send an arbitrary frame from within listener callback context.
     pub fn send(&mut self, frame: Frame, data: &[u8]) -> Result<(), Error<T::Error>> {

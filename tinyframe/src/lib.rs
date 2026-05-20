@@ -14,8 +14,14 @@ mod checksum;
 mod transport;
 mod parser;
 mod tx_core;
+mod tx_pipeline;
 mod channel;
+mod builder;
 mod tinyframe;
+mod observer_store;
+mod rx_dispatch_core;
+mod rx_parser_core;
+mod strategy;
 mod utils;
 
 // 重新导出最常用的类型
@@ -26,6 +32,6 @@ pub use frame::{Frame, ReceivedFrame};
 pub use checksum::{Checksum, NoChecksum, XorChecksum, Crc8Maxim, Crc16, Crc32};
 pub use transport::{Transport, BufferTransport};
 pub use channel::FrameChannel;
+pub use builder::TinyFrameBuilder;
+pub use strategy::{DispatchPolicy, IdAllocator, IdThenTypeDispatch, SequentialIdAllocator};
 pub use tinyframe::TinyFrame;
-
-

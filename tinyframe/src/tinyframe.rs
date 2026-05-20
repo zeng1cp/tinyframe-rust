@@ -1,10 +1,13 @@
 use crate::{
-    Checksum, Error, Frame, FrameCallback, FrameChannel, ListenerAction, ParseError, Peer,
+    Checksum, Error, Frame, FrameCallback, FrameChannel, ParseError, Peer,
     ReceivedFrame, Transport,
-    listener::{IdListener, ListenerId, TypeListener},
-    parser::{ParseStage, Parser},
+    listener::ListenerId,
+    observer_store::ObserverStore,
+    rx_dispatch_core::RxDispatchCore,
+    rx_parser_core::{ParsedFrameMeta, RxParserCore},
+    strategy::{DispatchPolicy, IdThenTypeDispatch, SequentialIdAllocator},
     tx_core::TxCore,
-    utils::{FieldKind, is_valid_width},
+    utils::is_valid_width,
 };
 
 pub struct TinyFrame<
@@ -17,19 +20,19 @@ pub struct TinyFrame<
     const ID: usize,
     const LEN: usize,
     const TY: usize,
+    A = SequentialIdAllocator,
+    D = IdThenTypeDispatch,
 > where
     T: Transport,
     K: Checksum,
+    A: crate::strategy::IdAllocator,
+    D: DispatchPolicy,
 {
     ctx: C,
-    tx: TxCore<T, K, ID, LEN, TY>,
-    parser_timeout_ticks: u16,
-    parser: Parser<K>,
-    rx_buf: [u8; RX],
-    id_listeners: [Option<IdListener<C, T, K, ID, LEN, TY>>; IDS],
-    type_listeners: [Option<TypeListener<C, T, K, ID, LEN, TY>>; TYPES],
-    generic_listener: Option<FrameCallback<C, T, K, ID, LEN, TY>>,
-    last_parse_error: Option<ParseError>,
+    tx: TxCore<T, K, A, ID, LEN, TY>,
+    rx: RxParserCore<K, RX>,
+    observers: ObserverStore<C, T, K, A, IDS, TYPES, ID, LEN, TY>,
+    dispatch_policy: D,
 }
 
 impl<
@@ -42,11 +45,69 @@ impl<
     const ID: usize,
     const LEN: usize,
     const TY: usize,
-> TinyFrame<C, T, K, RX, IDS, TYPES, ID, LEN, TY>
+    A,
+    D,
+> TinyFrame<C, T, K, RX, IDS, TYPES, ID, LEN, TY, A, D>
 where
     T: Transport,
     K: Checksum,
+    A: crate::strategy::IdAllocator + Default,
+    D: DispatchPolicy + Default,
 {
+    /// Create a `TinyFrame` with default façade parameters.
+    ///
+    /// Defaults:
+    /// - `peer`: `Peer::Master`
+    /// - `sof`: `0x01`
+    /// - `parser_timeout_ticks`: `10`
+    ///
+    /// # Example
+    /// ```no_run
+    /// use tinyframe::{TinyFrame, BufferTransport, NoChecksum};
+    ///
+    /// // 1) 给出一个常用类型别名，隐藏复杂泛型参数。
+    /// type Tf = TinyFrame<(), BufferTransport<256>, NoChecksum, 64, 4, 4, 1, 1, 1>;
+    /// // 2) 使用 new_simple 快速创建：默认 Master、SOF=0x01、超时 tick=10。
+    /// let _tf = Tf::new_simple((), BufferTransport::new(), NoChecksum).unwrap();
+    /// ```
+    ///
+    /// # UART + CRC 示例（更接近嵌入式真实场景）
+    /// ```no_run
+    /// use tinyframe::{TinyFrame, Transport, Crc16};
+    ///
+    /// // 模拟一个 UART 发送后端（真实项目里可包一层串口驱动 HAL）。
+    /// struct UartTransport {
+    ///     tx_log: [u8; 512],
+    ///     len: usize,
+    /// }
+    ///
+    /// impl UartTransport {
+    ///     fn new() -> Self { Self { tx_log: [0; 512], len: 0 } }
+    /// }
+    ///
+    /// impl Transport for UartTransport {
+    ///     // 这里用 () 简化错误类型；真实项目可替换为串口驱动自己的错误枚举。
+    ///     type Error = ();
+    ///     fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+    ///         let n = core::cmp::min(bytes.len(), self.tx_log.len().saturating_sub(self.len));
+    ///         self.tx_log[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+    ///         self.len += n;
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// // 使用 CRC16 作为校验算法；字段宽度示例中 ID/LEN/TYPE 都是 1 字节。
+    /// type TfUart = TinyFrame<(), UartTransport, Crc16, 128, 4, 4, 1, 1, 1>;
+    /// let _tf = TfUart::new_simple((), UartTransport::new(), Crc16).unwrap();
+    /// ```
+    pub fn new_simple(
+        ctx: C,
+        transport: T,
+        checksum: K,
+    ) -> Result<Self, Error<T::Error>> {
+        Self::new(ctx, transport, checksum, Peer::Master, 0x01, 10)
+    }
+
     /// Create a TinyFrame engine instance.
     ///
     /// # Type Parameters
@@ -54,6 +115,64 @@ where
     /// - `IDS`: ID listener slot count.
     /// - `TYPES`: type listener slot count.
     /// - `ID`/`LEN`/`TY`: encoded field widths in bytes (1..=4).
+    ///
+    /// # Example
+    /// ```no_run
+    /// use tinyframe::{TinyFrame, BufferTransport, NoChecksum, Peer};
+    ///
+    /// // 明确指定全部构造参数，适合需要精细控制场景。
+    /// type Tf = TinyFrame<(), BufferTransport<256>, NoChecksum, 64, 4, 4, 1, 1, 1>;
+    /// // 参数解释：
+    /// // - Peer::Master: 本端角色
+    /// // - 0x01: 帧起始字节 SOF
+    /// // - 10: 解析超时 tick
+    /// let _tf = Tf::new((), BufferTransport::new(), NoChecksum, Peer::Master, 0x01, 10).unwrap();
+    /// ```
+    ///
+    /// # 结合 UART 传输与 CRC32 校验
+    /// ```no_run
+    /// use tinyframe::{TinyFrame, Transport, Peer, Crc32};
+    ///
+    /// // 该示例展示如何把自定义传输层（UART）与 CRC 校验一起接入。
+    /// struct UartTransport {
+    ///     tx_log: [u8; 1024],
+    ///     len: usize,
+    /// }
+    ///
+    /// impl UartTransport {
+    ///     fn new() -> Self { Self { tx_log: [0; 1024], len: 0 } }
+    /// }
+    ///
+    /// impl Transport for UartTransport {
+    ///     type Error = ();
+    ///     fn begin_frame(&mut self) -> Result<(), Self::Error> {
+    ///         // 可选：例如拉高片选、打时间戳等。
+    ///         Ok(())
+    ///     }
+    ///     fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+    ///         let n = core::cmp::min(bytes.len(), self.tx_log.len().saturating_sub(self.len));
+    ///         self.tx_log[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+    ///         self.len += n;
+    ///         Ok(())
+    ///     }
+    ///     fn end_frame(&mut self) -> Result<(), Self::Error> {
+    ///         // 可选：例如 flush UART DMA。
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// // 这里选择 Crc32，接收缓冲区更大一些（RX=256）。
+    /// type TfUartCrc = TinyFrame<(), UartTransport, Crc32, 256, 8, 8, 1, 2, 1>;
+    ///
+    /// let _tf = TfUartCrc::new(
+    ///     (),                  // 用户上下文
+    ///     UartTransport::new(),// 自定义 UART 传输
+    ///     Crc32,               // CRC 校验策略
+    ///     Peer::Slave,         // 本端角色
+    ///     0xA5,                // SOF
+    ///     20,                  // parser 超时 tick
+    /// ).unwrap();
+    /// ```
     pub fn new(
         ctx: C,
         transport: T,
@@ -79,14 +198,11 @@ where
                 tx_busy: false,
                 multipart: None,
                 next_id: 0,
+                id_allocator: A::default(),
             },
-            parser_timeout_ticks,
-            parser: Parser::default(),
-            rx_buf: [0; RX],
-            id_listeners: core::array::from_fn(|_| None),
-            type_listeners: core::array::from_fn(|_| None),
-            generic_listener: None,
-            last_parse_error: None,
+            rx: RxParserCore::new(parser_timeout_ticks),
+            observers: ObserverStore::new(),
+            dispatch_policy: D::default(),
         })
     }
 
@@ -104,7 +220,7 @@ where
     }
     /// Last parse error observed during `accept`/`accept_byte`.
     pub fn last_parse_error(&self) -> Option<ParseError> {
-        self.last_parse_error
+        self.rx.last_parse_error
     }
 
     /// Send an outbound frame.
@@ -145,134 +261,67 @@ where
         &mut self,
         id: u32,
         timeout_ticks: u16,
-        on_frame: FrameCallback<C, T, K, ID, LEN, TY>,
+        on_frame: FrameCallback<C, T, K, A, ID, LEN, TY>,
     ) -> Result<ListenerId, Error<T::Error>> {
-        let slot = self
-            .id_listeners
-            .iter()
-            .position(|x| x.is_none())
-            .ok_or(Error::NoListenerSlot)?;
-        self.id_listeners[slot] = Some(IdListener {
-            id,
-            timeout_left: timeout_ticks,
-            timeout_max: timeout_ticks,
-            on_frame,
-        });
-        Ok(slot)
+        self.observers.add_id_listener(id, timeout_ticks, on_frame)
     }
 
     /// Register a type-based listener.
     pub fn add_type_listener(
         &mut self,
         typ: u32,
-        on_frame: FrameCallback<C, T, K, ID, LEN, TY>,
+        on_frame: FrameCallback<C, T, K, A, ID, LEN, TY>,
     ) -> Result<ListenerId, Error<T::Error>> {
-        let slot = self
-            .type_listeners
-            .iter()
-            .position(|x| x.is_none())
-            .ok_or(Error::NoListenerSlot)?;
-        self.type_listeners[slot] = Some(TypeListener { typ, on_frame });
-        Ok(slot)
+        self.observers.add_type_listener(typ, on_frame)
     }
 
     /// Register a catch-all listener when no ID/type listener handled frame.
-    pub fn set_generic_listener(&mut self, cb: FrameCallback<C, T, K, ID, LEN, TY>) {
-        self.generic_listener = Some(cb);
+    pub fn set_generic_listener(&mut self, cb: FrameCallback<C, T, K, A, ID, LEN, TY>) {
+        self.observers.generic_listener = Some(cb);
     }
 
     pub fn clear_generic_listener(&mut self) {
-        self.generic_listener = None;
+        self.observers.generic_listener = None;
     }
 
     /// Remove an ID listener by slot index.
     pub fn remove_id_listener(&mut self, listener_id: ListenerId) -> bool {
-        if listener_id >= IDS {
-            return false;
-        }
-        self.id_listeners[listener_id].take().is_some()
+        self.observers.remove_id_listener(listener_id)
     }
 
     /// Remove an ID listener by frame ID.
     pub fn remove_id_listener_by_frame_id(&mut self, frame_id: u32) -> bool {
-        for slot in &mut self.id_listeners {
-            if slot.as_ref().map(|x| x.id == frame_id).unwrap_or(false) {
-                *slot = None;
-                return true;
-            }
-        }
-        false
+        self.observers.remove_id_listener_by_frame_id(frame_id)
     }
 
     /// Remove a type listener by slot index.
     pub fn remove_type_listener(&mut self, listener_id: ListenerId) -> bool {
-        if listener_id >= TYPES {
-            return false;
-        }
-        self.type_listeners[listener_id].take().is_some()
+        self.observers.remove_type_listener(listener_id)
     }
 
     /// Remove a type listener by message type.
     pub fn remove_type_listener_by_type(&mut self, typ: u32) -> bool {
-        for slot in &mut self.type_listeners {
-            if slot.as_ref().map(|x| x.typ == typ).unwrap_or(false) {
-                *slot = None;
-                return true;
-            }
-        }
-        false
+        self.observers.remove_type_listener_by_type(typ)
     }
 
     /// Renew timeout for an ID listener matched by frame ID.
     pub fn renew_id_listener(&mut self, frame_id: u32) -> bool {
-        for slot in &mut self.id_listeners {
-            if let Some(listener) = slot {
-                if listener.id == frame_id {
-                    listener.timeout_left = listener.timeout_max;
-                    return true;
-                }
-            }
-        }
-        false
+        self.observers.renew_id_listener(frame_id)
     }
 
     /// Tick parser and listener timeout state machine.
     pub fn tick(&mut self) {
-        if self.parser.timeout > 0 {
-            self.parser.timeout -= 1;
-            if self.parser.timeout == 0 {
-                self.reset_parser();
-            }
-        }
+        self.rx.tick();
 
-        for i in 0..IDS {
-            let mut entry = match self.id_listeners[i].take() {
-                Some(e) => e,
-                None => continue,
-            };
-
-            if entry.timeout_left > 0 {
-                entry.timeout_left -= 1;
-                if entry.timeout_left == 0 {
-                    let frame = ReceivedFrame {
-                        id: entry.id,
-                        typ: 0,
-                        data: &[],
-                        timed_out: true,
-                    };
-                    let mut channel = FrameChannel { tx: &mut self.tx };
-                    let _ = (entry.on_frame)(&mut self.ctx, &mut channel, frame);
-                    continue;
-                }
-            }
-
-            self.id_listeners[i] = Some(entry);
-        }
+        self.observers.tick_timeouts(|frame, cb| {
+            let mut channel = FrameChannel { tx: &mut self.tx };
+            let _ = cb(&mut self.ctx, &mut channel, frame);
+        });
     }
 
     /// Reset incremental parser state.
     pub fn reset_parser(&mut self) {
-        self.parser = Parser::default();
+        self.rx.reset_parser();
     }
 
     /// Feed a byte slice into streaming parser.
@@ -284,195 +333,26 @@ where
 
     /// Feed one byte into streaming parser.
     pub fn accept_byte(&mut self, byte: u8) {
-        if self.parser.stage != ParseStage::Sof {
-            self.parser.timeout = self.parser_timeout_ticks;
-        }
-
-        match self.parser.stage {
-            ParseStage::Sof => {
-                if byte == self.tx.sof {
-                    self.parser = Parser {
-                        stage: ParseStage::Id,
-                        head_checksum: self.tx.checksum.start(),
-                        data_checksum: self.tx.checksum.start(),
-                        timeout: self.parser_timeout_ticks,
-                        ..Parser::default()
-                    };
-                }
-            }
-            ParseStage::Id => {
-                self.parse_field_byte(byte, ID, FieldKind::Id);
-            }
-            ParseStage::Len => {
-                self.parse_field_byte(byte, LEN, FieldKind::Len);
-            }
-            ParseStage::Type => {
-                self.parse_field_byte(byte, TY, FieldKind::Type);
-            }
-            ParseStage::Data => {
-                if self.parser.data_idx < RX {
-                    self.rx_buf[self.parser.data_idx] = byte;
-                }
-                self.parser.data_checksum = self.tx.checksum.add(self.parser.data_checksum, byte);
-                self.parser.data_idx += 1;
-                if self.parser.data_idx >= self.parser.len as usize {
-                    if K::WIDTH == 0 {
-                        self.dispatch_zero_copy();
-                        self.reset_parser();
-                    } else {
-                        self.parser.checksum_idx = 0;
-                        self.parser.stage = ParseStage::DataChecksum;
-                    }
-                }
-            }
-            ParseStage::HeadChecksum => {
-                if K::WIDTH == 0 {
-                    self.dispatch_zero_copy();
-                    self.reset_parser();
-                    return;
-                }
-                if self.parser.checksum_idx < self.parser.checksum_buf.len() {
-                    self.parser.checksum_buf[self.parser.checksum_idx] = byte;
-                }
-                self.parser.checksum_idx += 1;
-                if self.parser.checksum_idx >= K::WIDTH {
-                    let calc = self.tx.checksum.finish(self.parser.head_checksum);
-                    let recv = self
-                        .tx
-                        .checksum
-                        .decode(&self.parser.checksum_buf[..K::WIDTH]);
-                    if calc != recv {
-                        self.last_parse_error = Some(ParseError::ChecksumMismatch);
-                    } else {
-                        if self.parser.len == 0 {
-                            self.dispatch_zero_copy();
-                            self.reset_parser();
-                        } else {
-                            self.parser.stage = ParseStage::Data;
-                            self.parser.data_idx = 0;
-                            self.parser.data_checksum = self.tx.checksum.start();
-                        }
-                    }
-                }
-            }
-            ParseStage::DataChecksum => {
-                if self.parser.checksum_idx < self.parser.checksum_buf.len() {
-                    self.parser.checksum_buf[self.parser.checksum_idx] = byte;
-                }
-                self.parser.checksum_idx += 1;
-                if self.parser.checksum_idx >= K::WIDTH {
-                    let calc = self.tx.checksum.finish(self.parser.data_checksum);
-                    let recv = self
-                        .tx
-                        .checksum
-                        .decode(&self.parser.checksum_buf[..K::WIDTH]);
-                    if calc != recv {
-                        self.last_parse_error = Some(ParseError::ChecksumMismatch);
-                    } else {
-                        self.dispatch_zero_copy();
-                    }
-                    self.reset_parser();
-                }
-            }
-        }
-    }
-
-    fn parse_field_byte(&mut self, byte: u8, width: usize, target: FieldKind) {
-        // 1. 将当前字节纳入头部校验和计算
-        self.parser.head_checksum = self.tx.checksum.add(self.parser.head_checksum, byte);
-
-        // 2. 按大端序拼接字段值
-        let shift = ((width - 1 - self.parser.field_idx) * 8) as u32;
-        match target {
-            FieldKind::Len => self.parser.len |= (byte as u32) << shift,
-            FieldKind::Id => self.parser.id |= (byte as u32) << shift,
-            FieldKind::Type => self.parser.typ |= (byte as u32) << shift,
-        }
-        self.parser.field_idx += 1;
-
-        // 3. 若字段已完整接收，切换到下一阶段
-        if self.parser.field_idx >= width {
-            self.parser.field_idx = 0;
-            self.parser.stage = match target {
-                FieldKind::Id => ParseStage::Len,
-                FieldKind::Len => ParseStage::Type,
-                FieldKind::Type => {
-                    // TYPE 字段完成后，根据 LEN 决定走向
-                    if self.parser.len as usize > RX {
-                        // 载荷过大，记录错误并重置解析器
-                        self.last_parse_error = Some(ParseError::PayloadTooLarge);
-                        self.reset_parser();
-                        return;
-                    }
-                    if self.parser.len == 0 {
-                        // 无载荷：若校验和宽度为 0 则直接分发，否则进入头部校验和阶段
-                        if K::WIDTH == 0 {
-                            self.dispatch_zero_copy();
-                            self.reset_parser();
-                            return;
-                        }
-                        self.parser.checksum_idx = 0;
-                        ParseStage::HeadChecksum
-                    } else {
-                        // 有载荷：同样根据校验和宽度决定是否先进行头部校验
-                        if K::WIDTH == 0 {
-                            self.parser.data_idx = 0;
-                            self.parser.data_checksum = self.tx.checksum.start();
-                            ParseStage::Data
-                        } else {
-                            self.parser.checksum_idx = 0;
-                            ParseStage::HeadChecksum
-                        }
-                    }
-                }
+        let frame = self
+            .rx
+            .accept_byte(byte, self.tx.sof, &self.tx.checksum, (ID, LEN, TY));
+        if let Some(ParsedFrameMeta { id, typ, len }) = frame {
+            let frame = ReceivedFrame {
+                id,
+                typ,
+                data: &self.rx.rx_buf[..len],
+                timed_out: false,
             };
-        }
-    }
-
-    fn dispatch_zero_copy(&mut self) {
-        let frame = ReceivedFrame {
-            id: self.parser.id,
-            typ: self.parser.typ,
-            data: &self.rx_buf[..self.parser.len as usize],
-            timed_out: false,
-        };
-
-        let mut channel = FrameChannel { tx: &mut self.tx };
-        let mut handled = false;
-
-        // 1. 优先匹配 ID 监听器（点对点请求/响应）
-        for slot in &mut self.id_listeners {
-            if let Some(listener) = slot.as_mut() {
-                if listener.id == frame.id {
-                    handled = true;
-                    match (listener.on_frame)(&mut self.ctx, &mut channel, frame) {
-                        ListenerAction::Close => *slot = None,
-                        ListenerAction::Renew => listener.timeout_left = listener.timeout_max,
-                        ListenerAction::Stay | ListenerAction::Next => {}
-                    }
-                }
-            }
-        }
-
-        // 2. 其次匹配类型监听器（按消息类型处理）
-        for slot in &mut self.type_listeners {
-            if let Some(listener) = slot.as_mut() {
-                if listener.typ == frame.typ {
-                    handled = true;
-                    if let ListenerAction::Close =
-                        (listener.on_frame)(&mut self.ctx, &mut channel, frame)
-                    {
-                        *slot = None;
-                    }
-                }
-            }
-        }
-
-        // 3. 若未被处理，则调用通用监听器（catch-all）
-        if !handled {
-            if let Some(cb) = self.generic_listener {
-                cb(&mut self.ctx, &mut channel, frame);
-            }
+            RxDispatchCore::dispatch(
+                &mut self.ctx,
+                &mut self.tx,
+                &self.dispatch_policy,
+                &mut self.observers.id_listeners,
+                &mut self.observers.type_listeners,
+                self.observers.generic_listener,
+                frame,
+            );
+            self.rx.reset_parser();
         }
     }
 }
