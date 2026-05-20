@@ -58,6 +58,20 @@ where
     A: crate::strategy::IdAllocator + Default,
     D: DispatchPolicy + Default,
 {
+    /// Create a `TinyFrame` with default façade parameters.
+    ///
+    /// Defaults:
+    /// - `peer`: `Peer::Master`
+    /// - `sof`: `0x01`
+    /// - `parser_timeout_ticks`: `10`
+    ///
+    /// # Example
+    /// ```no_run
+    /// use tinyframe::{TinyFrame, BufferTransport, NoChecksum};
+    ///
+    /// type Tf = TinyFrame<(), BufferTransport<256>, NoChecksum, 64, 4, 4, 1, 1, 1>;
+    /// let _tf = Tf::new_simple((), BufferTransport::new(), NoChecksum).unwrap();
+    /// ```
     pub fn new_simple(
         ctx: C,
         transport: T,
@@ -73,6 +87,14 @@ where
     /// - `IDS`: ID listener slot count.
     /// - `TYPES`: type listener slot count.
     /// - `ID`/`LEN`/`TY`: encoded field widths in bytes (1..=4).
+    ///
+    /// # Example
+    /// ```no_run
+    /// use tinyframe::{TinyFrame, BufferTransport, NoChecksum, Peer};
+    ///
+    /// type Tf = TinyFrame<(), BufferTransport<256>, NoChecksum, 64, 4, 4, 1, 1, 1>;
+    /// let _tf = Tf::new((), BufferTransport::new(), NoChecksum, Peer::Master, 0x01, 10).unwrap();
+    /// ```
     pub fn new(
         ctx: C,
         transport: T,
