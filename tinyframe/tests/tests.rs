@@ -375,4 +375,100 @@ mod tests {
         assert_eq!(transport.abort_count, 0);
         assert_eq!(transport.bytes(), &[0x01, 0x10, 0x01, 0x02, 0xAA]);
     }
+
+    #[derive(Clone, Copy, Default)]
+    struct FixedAllocator;
+    impl IdAllocator for FixedAllocator {
+        fn alloc_id<const ID: usize>(&mut self, _next_id: &mut u32, _peer_master: bool) -> u32 {
+            let _ = ID;
+            0x2A
+        }
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct StopAfterIdDispatch;
+    impl DispatchPolicy for StopAfterIdDispatch {
+        fn dispatch<C, T, K, A, const IDS: usize, const TYPES: usize, const ID: usize, const LEN: usize, const TY: usize>(
+            &self,
+            ctx: &mut C,
+            channel: &mut FrameChannel<'_, T, K, ID, LEN, TY, A>,
+            id_listeners: &mut [Option<IdListener<C, T, K, A, ID, LEN, TY>>; IDS],
+            _type_listeners: &mut [Option<TypeListener<C, T, K, A, ID, LEN, TY>>; TYPES],
+            generic_listener: Option<FrameCallback<C, T, K, A, ID, LEN, TY>>,
+            frame: ReceivedFrame<'_>,
+        ) where
+            T: Transport,
+            K: Checksum,
+            A: IdAllocator,
+        {
+            let mut handled = false;
+            for slot in id_listeners {
+                if let Some(listener) = slot.as_mut() {
+                    if listener.id == frame.id {
+                        handled = true;
+                        let _ = (listener.on_frame)(ctx, channel, frame);
+                        break;
+                    }
+                }
+            }
+            if !handled {
+                if let Some(cb) = generic_listener {
+                    cb(ctx, channel, frame);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_id_allocator_is_used_for_request_ids() {
+        type TfCustomAlloc = TinyFrame<Ctx, BufferTransport<256>, NoChecksum, 64, 2, 2, 1, 1, 1, FixedAllocator, IdThenTypeDispatch>;
+        let mut tf = TfCustomAlloc::new(
+            Ctx::default(),
+            BufferTransport::new(),
+            NoChecksum,
+            Peer::Master,
+            0x01,
+            10,
+        ).unwrap();
+
+        tf.send(Frame { id: 0, typ: 0x10, is_response: false }, &[1]).unwrap();
+        let bytes = tf.transport_mut().bytes();
+        assert_eq!(bytes[1], 0x2A);
+    }
+
+    #[test]
+    fn custom_dispatch_policy_can_short_circuit_type_listeners() {
+        type TfCustomDispatch = TinyFrame<Ctx, BufferTransport<256>, NoChecksum, 64, 2, 2, 1, 1, 1, SequentialIdAllocator, StopAfterIdDispatch>;
+        let mut tf = TfCustomDispatch::new(
+            Ctx::default(),
+            BufferTransport::new(),
+            NoChecksum,
+            Peer::Slave,
+            0x01,
+            10,
+        ).unwrap();
+
+        fn id_cb(
+            ctx: &mut Ctx,
+            _: &mut FrameChannel<'_, BufferTransport<256>, NoChecksum, 1, 1, 1, SequentialIdAllocator>,
+            frame: ReceivedFrame<'_>,
+        ) -> ListenerAction {
+            ctx.seen_type = frame.typ;
+            ListenerAction::Stay
+        }
+        fn type_cb(
+            ctx: &mut Ctx,
+            _: &mut FrameChannel<'_, BufferTransport<256>, NoChecksum, 1, 1, 1, SequentialIdAllocator>,
+            _frame: ReceivedFrame<'_>,
+        ) -> ListenerAction {
+            ctx.seen_len = 99;
+            ListenerAction::Stay
+        }
+
+        tf.add_id_listener(0x33, 0, id_cb).unwrap();
+        tf.add_type_listener(0x07, type_cb).unwrap();
+        tf.accept(&[0x01, 0x33, 0x00, 0x07]);
+        assert_eq!(tf.context().seen_type, 0x07);
+        assert_eq!(tf.context().seen_len, 0);
+    }
 }

@@ -306,16 +306,13 @@ fn handle_client(stream: TcpStream) -> io::Result<()> {
     let mut read_stream = stream.try_clone()?;
     let transport = SocketTransport(stream);
 
-    // 创建 TinyFrame 实例，无校验和
-    let mut tf = TinyFrame::<_, _, _, 1024, 5, 5, ID_BYTES, LEN_BYTES, TYPE_BYTES>::new(
-        Ctx::default(),
-        transport,
-        NoChecksum,
-        Peer::Slave,   // 服务器作为 Slave
-        SOF,
-        10,            // parser timeout ticks
-    )
-    .expect("创建 TinyFrame 失败");
+    // 使用最新的 Builder 构建 TinyFrame（无校验和）
+    let mut tf = TinyFrameBuilder::new(Ctx::default(), transport, NoChecksum)
+        .peer(Peer::Slave) // 服务器作为 Slave
+        .sof(SOF)
+        .parser_timeout_ticks(10)
+        .build::<1024, 5, 5, ID_BYTES, LEN_BYTES, TYPE_BYTES>()
+        .expect("创建 TinyFrame 失败");
 
     // 注册类型监听器
     tf.add_type_listener(0x22, echo_listener)
