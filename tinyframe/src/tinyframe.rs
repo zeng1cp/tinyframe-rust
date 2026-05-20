@@ -58,6 +58,14 @@ where
     A: crate::strategy::IdAllocator + Default,
     D: DispatchPolicy + Default,
 {
+    pub fn new_simple(
+        ctx: C,
+        transport: T,
+        checksum: K,
+    ) -> Result<Self, Error<T::Error>> {
+        Self::new(ctx, transport, checksum, Peer::Master, 0x01, 10)
+    }
+
     /// Create a TinyFrame engine instance.
     ///
     /// # Type Parameters
