@@ -1,8 +1,9 @@
 use crate::{
-    Checksum, Error, Frame, FrameCallback, FrameChannel, ListenerAction, ParseError, Peer,
+    Checksum, Error, Frame, FrameCallback, FrameChannel, ParseError, Peer,
     ReceivedFrame, Transport,
     listener::{IdListener, ListenerId, TypeListener},
     parser::{ParseStage, Parser},
+    rx_dispatch_core::RxDispatchCore,
     tx_core::TxCore,
     utils::{FieldKind, is_valid_width},
 };
@@ -437,42 +438,13 @@ where
             timed_out: false,
         };
 
-        let mut channel = FrameChannel { tx: &mut self.tx };
-        let mut handled = false;
-
-        // 1. 优先匹配 ID 监听器（点对点请求/响应）
-        for slot in &mut self.id_listeners {
-            if let Some(listener) = slot.as_mut() {
-                if listener.id == frame.id {
-                    handled = true;
-                    match (listener.on_frame)(&mut self.ctx, &mut channel, frame) {
-                        ListenerAction::Close => *slot = None,
-                        ListenerAction::Renew => listener.timeout_left = listener.timeout_max,
-                        ListenerAction::Stay | ListenerAction::Next => {}
-                    }
-                }
-            }
-        }
-
-        // 2. 其次匹配类型监听器（按消息类型处理）
-        for slot in &mut self.type_listeners {
-            if let Some(listener) = slot.as_mut() {
-                if listener.typ == frame.typ {
-                    handled = true;
-                    if let ListenerAction::Close =
-                        (listener.on_frame)(&mut self.ctx, &mut channel, frame)
-                    {
-                        *slot = None;
-                    }
-                }
-            }
-        }
-
-        // 3. 若未被处理，则调用通用监听器（catch-all）
-        if !handled {
-            if let Some(cb) = self.generic_listener {
-                cb(&mut self.ctx, &mut channel, frame);
-            }
-        }
+        RxDispatchCore::dispatch(
+            &mut self.ctx,
+            &mut self.tx,
+            &mut self.id_listeners,
+            &mut self.type_listeners,
+            self.generic_listener,
+            frame,
+        );
     }
 }
